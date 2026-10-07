@@ -5,9 +5,9 @@
 //! (`decoder::output_format_for`). This suite pins the two public ways
 //! that choice is surfaced to callers:
 //!
-//! * [`DiracDecoder::output_pixel_format`] — the format the decoder
-//!   will emit for the current sequence, queryable after the first
-//!   `send_packet`.
+//! * [`Decoder::output_pixel_format`] — the format of the next frame,
+//!   queryable after the first `send_packet` (the sequence header of the
+//!   first pending picture).
 //! * [`Decoder::receive_arena_frame`] — the arena-backed frame path,
 //!   whose `FrameHeader` must carry the real picture width / height
 //!   and the true output format (the trait-default implementation can

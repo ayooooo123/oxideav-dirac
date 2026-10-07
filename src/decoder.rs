@@ -46,6 +46,12 @@ pub struct DiracDecoder {
     pending_pts: std::collections::VecDeque<Option<i64>>,
     /// `time_base` paired with each `pending_pts` entry.
     pending_time_base: std::collections::VecDeque<TimeBase>,
+    /// The sequence header in force when each pending picture was
+    /// scanned: the one it decodes against, even when a later sequence
+    /// header is already parsed.
+    pending_seq: std::collections::VecDeque<SequenceHeader>,
+    /// The layout of the frame `receive_frame` last returned.
+    last_output: Option<FrameLayout>,
     /// PTS + time_base carried by the most recent `send_packet` call,
     /// so `scan()` (which runs after the append) can tag any newly
     /// discovered data units with the right metadata.
@@ -75,6 +81,8 @@ impl DiracDecoder {
             pending_codes: std::collections::VecDeque::new(),
             pending_pts: std::collections::VecDeque::new(),
             pending_time_base: std::collections::VecDeque::new(),
+            pending_seq: std::collections::VecDeque::new(),
+            last_output: None,
             last_packet_pts: None,
             last_packet_time_base: TimeBase::new(1, 25),
             eof: false,
@@ -89,19 +97,6 @@ impl DiracDecoder {
     /// feeding a few packets in.
     pub fn last_sequence(&self) -> Option<&SequenceHeader> {
         self.last_sequence.as_ref()
-    }
-
-    /// The oxideav-core [`PixelFormat`] this decoder emits for pictures
-    /// of the most recently parsed sequence header, or `None` before
-    /// any header has been seen. Derived from the header's §10.3.3
-    /// chroma format and §10.5.2 luma depth via [`output_format_for`] —
-    /// the same choice `receive_frame` uses to pack planes, so callers
-    /// wiring the frame into format-aware plumbing can consult this
-    /// after the first `send_packet`.
-    pub fn output_pixel_format(&self) -> Option<PixelFormat> {
-        self.last_sequence
-            .as_ref()
-            .map(|s| output_format_for(s.video_params.chroma_format, s.luma_depth).0)
     }
 
     /// Walk any new bytes appended to the buffer. We remember how far
@@ -158,10 +153,14 @@ impl DiracDecoder {
                     }
                 }
             } else if pi.is_picture() {
-                self.pending.push_back(payload.clone());
-                self.pending_codes.push_back(parse_code);
-                self.pending_pts.push_back(self.last_packet_pts);
-                self.pending_time_base.push_back(self.last_packet_time_base);
+                // A picture before any sequence header cannot be decoded.
+                if let Some(seq) = &self.last_sequence {
+                    self.pending.push_back(payload.clone());
+                    self.pending_codes.push_back(parse_code);
+                    self.pending_pts.push_back(self.last_packet_pts);
+                    self.pending_time_base.push_back(self.last_packet_time_base);
+                    self.pending_seq.push_back(seq.clone());
+                }
             }
             let payload_end = start + pi_offset + 13 + payload.len();
             self.scan_cursor = payload_end.max(self.scan_cursor);
@@ -176,16 +175,8 @@ impl DiracDecoder {
                 None => return Ok(None),
             };
             let code = self.pending_codes.front().copied().unwrap_or(0);
-            let seq = match self.last_sequence.as_ref() {
-                Some(s) => s.clone(),
-                None => {
-                    // Drop pictures that arrive before any seq header.
-                    self.pending.pop_front();
-                    self.pending_codes.pop_front();
-                    self.pending_pts.pop_front();
-                    self.pending_time_base.pop_front();
-                    continue;
-                }
+            let Some(seq) = self.pending_seq.front().cloned() else {
+                return Ok(None);
             };
             let pi = crate::parse_info::ParseInfo {
                 parse_code: code,
@@ -196,6 +187,7 @@ impl DiracDecoder {
                 Ok(pic) => {
                     self.pending.pop_front();
                     self.pending_codes.pop_front();
+                    self.pending_seq.pop_front();
                     let pkt_pts = self.pending_pts.pop_front().flatten();
                     let pkt_tb = self
                         .pending_time_base
@@ -218,6 +210,12 @@ impl DiracDecoder {
                         pkt_tb
                     };
                     let effective_pts = pkt_pts.or(Some(pic.picture_number as i64));
+                    self.last_output = Some(frame_layout(
+                        &seq,
+                        (pic.luma_width, pic.luma_height),
+                        (pic.chroma_width, pic.chroma_height),
+                        pic.luma_depth,
+                    ));
                     return Ok(Some(decoded_to_video_frame(
                         &pic,
                         &seq,
@@ -232,6 +230,7 @@ impl DiracDecoder {
                     self.pending_codes.pop_front();
                     self.pending_pts.pop_front();
                     self.pending_time_base.pop_front();
+                    self.pending_seq.pop_front();
                     continue;
                 }
                 Err(PictureError::InterNotImplemented) => {
@@ -241,6 +240,7 @@ impl DiracDecoder {
                     self.pending_codes.pop_front();
                     self.pending_pts.pop_front();
                     self.pending_time_base.pop_front();
+                    self.pending_seq.pop_front();
                     continue;
                 }
                 Err(PictureError::CoreSyntaxNotImplemented) => {
@@ -288,6 +288,57 @@ impl DiracDecoder {
             self.reference_buffer.remove(0);
         }
     }
+
+    /// The layout `output_*` report: the frame last returned; before the
+    /// first, the sequence header of the next pending picture, else the
+    /// last validated sequence header.
+    fn reported_layout(&self) -> Option<FrameLayout> {
+        self.last_output.or_else(|| {
+            let seq = self.pending_seq.front().or(self.last_sequence.as_ref())?;
+            Some(frame_layout(
+                seq,
+                (seq.luma_width as usize, seq.luma_height as usize),
+                (seq.chroma_width as usize, seq.chroma_height as usize),
+                seq.luma_depth,
+            ))
+        })
+    }
+}
+
+/// The size and pixel layout of a decoded frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FrameLayout {
+    /// Luma width × height.
+    size: (u32, u32),
+    /// The storage format the planes are packed in ([`output_format_for`]).
+    format: PixelFormat,
+    /// Whether the chroma planes have `format`'s plane sizes. §10.5.1
+    /// halves an odd subsampled dimension rounding down, where
+    /// `PixelFormat` rounds up, so such a frame matches no `PixelFormat`.
+    exact: bool,
+}
+
+/// The [`FrameLayout`] of a picture of `seq` with the given luma and
+/// chroma plane sizes and luma depth, as `decoded_to_video_frame` packs it.
+fn frame_layout(
+    seq: &SequenceHeader,
+    (width, height): (usize, usize),
+    chroma: (usize, usize),
+    luma_depth: u32,
+) -> FrameLayout {
+    let (format, _) = output_format_for(seq.video_params.chroma_format, luma_depth);
+    let size = (
+        u32::try_from(width).unwrap_or(u32::MAX),
+        u32::try_from(height).unwrap_or(u32::MAX),
+    );
+    let exact = format
+        .plane_dimensions(1, size.0, size.1)
+        .is_some_and(|(cw, ch)| (cw as usize, ch as usize) == chroma);
+    FrameLayout {
+        size,
+        format,
+        exact,
+    }
 }
 
 impl Decoder for DiracDecoder {
@@ -321,18 +372,31 @@ impl Decoder for DiracDecoder {
         }
     }
 
+    fn output_video_dimensions(&self) -> Option<(u32, u32)> {
+        self.reported_layout()
+            .map(|layout| layout.size)
+            .filter(|&(w, h)| w > 0 && h > 0)
+    }
+
+    /// `None` for a frame whose chroma planes match no `PixelFormat` (see
+    /// [`FrameLayout::exact`]).
+    fn output_pixel_format(&self) -> Option<PixelFormat> {
+        self.reported_layout()
+            .filter(|layout| layout.exact)
+            .map(|layout| layout.format)
+    }
+
     fn flush(&mut self) -> Result<()> {
         self.eof = true;
         self.scan()
     }
 
     /// Arena-backed variant of `receive_frame` with a **correct**
-    /// [`oxideav_core::arena::FrameHeader`]: real picture width /
-    /// height from the sequence header (§10.5.1 — field-coded streams
-    /// report the per-picture field height) and the true output
-    /// [`PixelFormat`] from [`output_format_for`], including the
-    /// 10/12-bit and deep-colour 16-bit surfaces the trait-default
-    /// implementation cannot guess from plane shapes alone.
+    /// [`oxideav_core::arena::FrameHeader`]: the returned picture's width /
+    /// height (§10.5.1 — field-coded streams report the per-picture field
+    /// height) and its output [`PixelFormat`] from [`output_format_for`],
+    /// including the 10/12-bit and deep-colour 16-bit surfaces the
+    /// trait-default implementation cannot guess from plane shapes alone.
     fn receive_arena_frame(&mut self) -> Result<oxideav_core::arena::sync::Frame> {
         let frame = self.receive_frame()?;
         let v = match frame {
@@ -343,12 +407,10 @@ impl Decoder for DiracDecoder {
                 ))
             }
         };
-        // `receive_frame` only succeeds after a sequence header has
-        // been parsed, so `last_sequence` is populated here.
-        let seq = self.last_sequence.as_ref().ok_or_else(|| {
-            Error::invalid("dirac: receive_arena_frame: frame decoded without a sequence header")
+        // `receive_frame` records the layout of every frame it returns.
+        let layout = self.last_output.ok_or_else(|| {
+            Error::invalid("dirac: receive_arena_frame: frame returned without a layout")
         })?;
-        let (format, _) = output_format_for(seq.video_params.chroma_format, seq.luma_depth);
 
         let total_bytes: usize = v.planes.iter().map(|p| p.data.len()).sum();
         let pool = oxideav_core::arena::sync::ArenaPool::with_alloc_count_cap(
@@ -365,8 +427,12 @@ impl Decoder for DiracDecoder {
             plane_offsets.push((cursor, plane.data.len()));
             cursor += plane.data.len();
         }
-        let header =
-            oxideav_core::arena::FrameHeader::new(seq.luma_width, seq.luma_height, format, v.pts);
+        let header = oxideav_core::arena::FrameHeader::new(
+            layout.size.0,
+            layout.size.1,
+            layout.format,
+            v.pts,
+        );
         oxideav_core::arena::sync::FrameInner::new(arena, &plane_offsets, header)
     }
 }

@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `Decoder::output_video_dimensions` / `output_pixel_format`: the size and
+  format of the frame last returned; before the first, the sequence
+  header of the next pending picture. The format is `None` when §10.5.1
+  halves an odd subsampled size rounding down, so the chroma planes match
+  no `PixelFormat`. Replaces the inherent `DiracDecoder::output_pixel_format`.
+  `receive_arena_frame` takes its header from the same per-frame layout.
+
 - Legacy container-tag co-claim: `register_codecs` now declares all
   three registered container codes for this bitstream syntax —
   Matroska `V_DIRAC`, the MP4/QuickTime sample entry `drac` (already
@@ -161,6 +168,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the §10.3.8 custom ranges 13-16-bit streams require).
 
 ### Fixed
+
+- A picture queued behind a newer sequence header decodes against the
+  header it was coded with, not the newest one.
 
 - `obmc_block_sse` squared the per-pixel reconstruction error in
   `i32`; at 16-bit the difference spans ±2^17 and the square
