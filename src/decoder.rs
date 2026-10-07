@@ -46,10 +46,18 @@ pub struct DiracDecoder {
     pending_pts: std::collections::VecDeque<Option<i64>>,
     /// `time_base` paired with each `pending_pts` entry.
     pending_time_base: std::collections::VecDeque<TimeBase>,
-    /// The sequence header in force when each pending picture was
-    /// scanned: the one it decodes against, even when a later sequence
-    /// header is already parsed.
-    pending_seq: std::collections::VecDeque<SequenceHeader>,
+    /// The sequence each pending picture belongs to (see [`Self::sequence`])
+    /// and the sequence header in force when it was scanned: the one it
+    /// decodes against, even when a later sequence header is already
+    /// parsed.
+    pending_seq: std::collections::VecDeque<(u64, SequenceHeader)>,
+    /// Number of the sequence `scan` is in: it advances at an
+    /// end-of-sequence data unit and at a sequence header that differs
+    /// from the one in force (a repeated header within a sequence keeps
+    /// it).
+    sequence: u64,
+    /// Number of the sequence whose pictures fill `reference_buffer`.
+    reference_sequence: u64,
     /// The layout of the frame `receive_frame` last returned.
     last_output: Option<FrameLayout>,
     /// PTS + time_base carried by the most recent `send_packet` call,
@@ -82,6 +90,8 @@ impl DiracDecoder {
             pending_pts: std::collections::VecDeque::new(),
             pending_time_base: std::collections::VecDeque::new(),
             pending_seq: std::collections::VecDeque::new(),
+            sequence: 0,
+            reference_sequence: 0,
             last_output: None,
             last_packet_pts: None,
             last_packet_time_base: TimeBase::new(1, 25),
@@ -146,6 +156,9 @@ impl DiracDecoder {
                         if crate::trace::enabled() {
                             emit_sequence_trace(&sh);
                         }
+                        if self.last_sequence.as_ref() != Some(&sh) {
+                            self.sequence += 1;
+                        }
                         self.last_sequence = Some(sh);
                     }
                     Err(e) => {
@@ -159,8 +172,12 @@ impl DiracDecoder {
                     self.pending_codes.push_back(parse_code);
                     self.pending_pts.push_back(self.last_packet_pts);
                     self.pending_time_base.push_back(self.last_packet_time_base);
-                    self.pending_seq.push_back(seq.clone());
+                    self.pending_seq.push_back((self.sequence, seq.clone()));
                 }
+            } else if pi.is_end_of_sequence() {
+                // The next picture starts a new sequence, which shares no
+                // reference pictures with this one.
+                self.sequence += 1;
             }
             let payload_end = start + pi_offset + 13 + payload.len();
             self.scan_cursor = payload_end.max(self.scan_cursor);
@@ -175,9 +192,16 @@ impl DiracDecoder {
                 None => return Ok(None),
             };
             let code = self.pending_codes.front().copied().unwrap_or(0);
-            let Some(seq) = self.pending_seq.front().cloned() else {
+            let Some((sequence, seq)) = self.pending_seq.front().cloned() else {
                 return Ok(None);
             };
+            // The first picture of a new sequence retires the previous
+            // sequence's references; pictures still queued from that
+            // sequence decoded before it, against them.
+            if sequence != self.reference_sequence {
+                self.reference_buffer.clear();
+                self.reference_sequence = sequence;
+            }
             let pi = crate::parse_info::ParseInfo {
                 parse_code: code,
                 next_parse_offset: 0,
@@ -294,7 +318,11 @@ impl DiracDecoder {
     /// last validated sequence header.
     fn reported_layout(&self) -> Option<FrameLayout> {
         self.last_output.or_else(|| {
-            let seq = self.pending_seq.front().or(self.last_sequence.as_ref())?;
+            let seq = self
+                .pending_seq
+                .front()
+                .map(|(_, seq)| seq)
+                .or(self.last_sequence.as_ref())?;
             Some(frame_layout(
                 seq,
                 (seq.luma_width as usize, seq.luma_height as usize),

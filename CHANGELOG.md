@@ -172,6 +172,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A picture queued behind a newer sequence header decodes against the
   header it was coded with, not the newest one.
 
+- A new sequence no longer predicts from the previous sequence's
+  reference pictures. Picture numbers restart with each sequence, and
+  the reference lookup took the first picture with the wanted number, so
+  an inter picture could predict from the previous sequence's picture
+  (of another size, too). The reference buffer now empties when the
+  first picture after an end of sequence, or after a different sequence
+  header, is decoded; pictures of the old sequence still queued at that
+  point decode first, against their own references.
+
 - `obmc_block_sse` squared the per-pixel reconstruction error in
   `i32`; at 16-bit the difference spans ±2^17 and the square
   overflowed. Widen to `i64` before squaring (identical scores for
