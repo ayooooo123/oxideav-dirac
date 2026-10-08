@@ -1225,6 +1225,7 @@ impl<'s> FragmentedPictureDecoder<'s> {
             v,
             luma_depth: self.sequence.luma_depth,
             chroma_depth: self.sequence.chroma_depth,
+            retired_picture: None,
         })
     }
 }

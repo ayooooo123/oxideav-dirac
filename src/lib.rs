@@ -208,6 +208,9 @@ pub mod picture_core;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub mod picture_inter;
+// LGPL-2.1-or-later: FFmpeg's choice of references and of the order
+// pictures are shown in.
+pub(crate) mod picture_order;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub mod quant;

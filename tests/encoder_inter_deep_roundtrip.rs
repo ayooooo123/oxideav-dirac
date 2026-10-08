@@ -38,7 +38,7 @@ use oxideav_dirac::video_format::{ChromaFormat, SignalRange};
 use oxideav_dirac::wavelet::WaveletFilter;
 
 /// Decode a whole elementary stream through the registry decoder and
-/// return the frames in decode order.
+/// return the frames in picture-number order, as FFmpeg outputs them.
 fn decode_stream(stream: Vec<u8>) -> Vec<VideoFrame> {
     let mut reg = CodecRegistry::new();
     oxideav_dirac::register_codecs(&mut reg);
@@ -46,6 +46,7 @@ fn decode_stream(stream: Vec<u8>) -> Vec<VideoFrame> {
     let mut dec = reg.first_decoder(&cp).expect("make decoder");
     let pkt = Packet::new(0, TimeBase::new(1, 25), stream);
     dec.send_packet(&pkt).expect("send_packet");
+    dec.flush().expect("flush");
     let mut out = Vec::new();
     while let Ok(frame) = dec.receive_frame() {
         match frame {
@@ -293,7 +294,7 @@ fn assert_bipred_chain_bit_exact(depth: u32, sr: SignalRange) {
         &bipred,
     );
     let frames = decode_stream(stream);
-    assert_eq!(frames.len(), 3, "expected intra-A, intra-B, bipred B");
+    assert_eq!(frames.len(), 3, "expected intra-A, bipred B, intra-B");
     assert_plane_eq(
         &format!("{depth}-bit intra-A Y"),
         &frames[0].planes[0].data,
@@ -301,22 +302,22 @@ fn assert_bipred_chain_bit_exact(depth: u32, sr: SignalRange) {
     );
     assert_plane_eq(
         &format!("{depth}-bit intra-B Y"),
-        &frames[1].planes[0].data,
+        &frames[2].planes[0].data,
         &yb,
     );
     assert_plane_eq(
         &format!("{depth}-bit bipred Y"),
-        &frames[2].planes[0].data,
+        &frames[1].planes[0].data,
         &ym,
     );
     assert_plane_eq(
         &format!("{depth}-bit bipred U"),
-        &frames[2].planes[1].data,
+        &frames[1].planes[1].data,
         &c,
     );
     assert_plane_eq(
         &format!("{depth}-bit bipred V"),
-        &frames[2].planes[2].data,
+        &frames[1].planes[2].data,
         &c,
     );
 }
@@ -523,7 +524,7 @@ fn bipred_16bit_global_both_refs_q0_bit_exact() {
     assert_eq!(frames.len(), 3);
     assert_plane_eq(
         "global bipred 16-bit B Y",
-        &frames[2].planes[0].data,
+        &frames[1].planes[0].data,
         &yb_pic,
     );
 }

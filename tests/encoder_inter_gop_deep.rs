@@ -81,6 +81,7 @@ fn decode_frames(stream: Vec<u8>) -> Vec<VideoFrame> {
     let mut dec = reg.first_decoder(&cp).expect("make decoder");
     let pkt = Packet::new(0, TimeBase::new(1, 25), stream);
     dec.send_packet(&pkt).expect("send_packet");
+    dec.flush().expect("flush");
     let mut out = Vec::new();
     while let Ok(Frame::Video(v)) = dec.receive_frame() {
         out.push(v);
@@ -160,16 +161,12 @@ fn deep_gop_q0_bit_exact_16bit() {
         u32::MAX,
         InterRateControl::PerPicture,
     );
+    // Coded anchor(0), P(2), B(1), P(4), B(3); output in display order,
+    // as FFmpeg does.
     let decoded = decode_frames(stream);
     assert_eq!(decoded.len(), frames.len());
-    // Coded order for n=5, s=1: anchor(0), P(2), B(1), P(4), B(3).
-    let order = [0usize, 2, 1, 4, 3];
-    for (coded_i, &display_i) in order.iter().enumerate() {
-        assert_frame_bit_exact(
-            &decoded[coded_i],
-            &frames[display_i],
-            &format!("16-bit GOP display frame {display_i}"),
-        );
+    for (i, (vf, f)) in decoded.iter().zip(&frames).enumerate() {
+        assert_frame_bit_exact(vf, f, &format!("16-bit GOP display frame {i}"));
     }
 }
 

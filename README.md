@@ -105,4 +105,7 @@ cargo bench -p oxideav-dirac --bench roundtrip
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE) — except `src/picture_order.rs`, a port of
+FFmpeg 2da55bf's choice of references and of the order pictures are shown
+in (diracdec.c), which is LGPL-2.1-or-later — see `LICENSE-LGPL`. The crate
+as a whole is `MIT AND LGPL-2.1-or-later`.

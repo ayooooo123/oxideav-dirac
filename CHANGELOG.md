@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed (PearTube fork)
+
+- Inter pictures, their references and the output order as FFmpeg 2da55bf's
+  `diracdec.c` has them (`src/picture_order.rs`, LGPL-2.1-or-later port;
+  the crate is now `MIT AND LGPL-2.1-or-later`, see `LICENSE-LGPL`). FATE
+  `dirac/vts.profile-main.drc` now decodes to FFmpeg's 30 frames, each
+  equal and in FFmpeg's order; before, 13 were dropped and the rest came
+  out in decode order.
+  - A picture naming a reference that is not held predicts from the held
+    one whose number is closest; with none held, from a blank picture.
+    Before, it was dropped.
+  - A reference picture retires the picture its header names, then joins;
+    up to 8 are held, then the oldest goes. Before, the retire delta was
+    ignored and only 4 were held.
+  - Pictures come out in picture-number order, as FFmpeg's delay buffer
+    gives them: one ahead of the next number waits (up to 5), one behind
+    it is dropped, and the waiting ones come out at the end of the
+    stream (`flush`). Frames of an I/P/B stream now arrive in display
+    order, not decode order.
+  - Unlike FFmpeg, a new sequence first shows the pictures still waiting
+    and starts the count again. FFmpeg ignores a second sequence header
+    and keeps its count, so it would show none of the next sequence's
+    pictures numbered below it.
+  - `reset` (a seek) clears the waiting pictures, the references and the
+    sequence header, as FFmpeg's `dirac_decode_flush`. The default
+    `reset` left the count, so pictures sent after a seek back were
+    dropped.
+  - `PictureError::MissingReference` is gone: a missing reference no
+    longer fails a picture.
+- Builds against the PearTube oxideav-core fork (`[patch.crates-io]`).
+
 ### Added
 
 - `Decoder::output_video_dimensions` / `output_pixel_format`: the size and

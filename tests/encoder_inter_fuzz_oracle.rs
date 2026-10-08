@@ -111,6 +111,8 @@ fn assert_decodes_to(stream: &[u8], expected_frames: usize, label: &str) {
     let pkt = Packet::new(0, TimeBase::new(1, 25), stream.to_vec());
     dec.send_packet(&pkt)
         .unwrap_or_else(|e| panic!("{label}: send_packet failed: {e:?}"));
+    dec.flush()
+        .unwrap_or_else(|e| panic!("{label}: flush failed: {e:?}"));
 
     let mut frames = 0usize;
     // Generous cap so a hypothetical "always returns Ok with an empty

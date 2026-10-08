@@ -23,6 +23,7 @@
 
 use crate::bits::BitReader;
 use crate::parse_info::ParseInfo;
+use crate::picture_order::{blank_reference, closest_reference};
 use crate::quant::{inverse_quant, slice_quantisers, QuantMatrix};
 use crate::sequence::SequenceHeader;
 use crate::subband::{init_pyramid_ho, slice_band_order, subband_dims_ho, Orient, SubbandData};
@@ -43,6 +44,11 @@ pub struct DecodedPicture {
     pub v: Vec<i32>,
     pub luma_depth: u32,
     pub chroma_depth: u32,
+    /// The reference picture this picture's header retires (§11.1.1
+    /// `RETD`): set on a reference picture whose retire delta names
+    /// another picture. The decoder front-end drops it from its
+    /// reference buffer before admitting this one, as FFmpeg does.
+    pub retired_picture: Option<u32>,
 }
 
 /// A decoded picture held in its **signed, clipped, pre-output-offset**
@@ -130,10 +136,6 @@ pub enum PictureError {
     },
     /// Slice data wider than its declared byte length.
     SliceOverflow,
-    /// Inter picture referenced a picture number not in the reference
-    /// buffer. The decoder front-end is responsible for keeping the
-    /// buffer up to date.
-    MissingReference(u32),
 }
 
 impl core::fmt::Display for PictureError {
@@ -156,9 +158,6 @@ impl core::fmt::Display for PictureError {
                 "v3 asymmetric transform: no Annex D default quant matrix for this combination (wavelet_index_ho={wavelet_index_ho}, dwt_depth_ho={dwt_depth_ho}); a custom matrix is required (§12.4.5.3)"
             ),
             Self::SliceOverflow => write!(f, "slice data overflows declared length"),
-            Self::MissingReference(n) => {
-                write!(f, "inter picture references missing picture number {n}")
-            }
         }
     }
 }
@@ -470,6 +469,7 @@ fn decode_low_delay_picture(
         v,
         luma_depth: sequence.luma_depth,
         chroma_depth: sequence.chroma_depth,
+        retired_picture: None,
     })
 }
 
@@ -522,6 +522,7 @@ fn decode_core_syntax_picture(
     // Inter pictures: §9.6.1 reference deltas, §11.2 picture prediction
     // parameters + block motion data, then §11.3 wavelet residue
     // (optionally all-zero).
+    let mut retire_delta: Option<i32> = None;
     let inter_ctx = if parse_info.is_inter() {
         let num_refs = parse_info.num_refs() as u32;
         let d1 = r.read_sint();
@@ -533,7 +534,7 @@ fn decode_core_syntax_picture(
             None
         };
         if parse_info.is_reference() {
-            let _retd = r.read_sint();
+            retire_delta = Some(r.read_sint());
         }
         r.byte_align();
         let pred =
@@ -549,7 +550,7 @@ fn decode_core_syntax_picture(
         })
     } else {
         if parse_info.is_reference() {
-            let _retd = r.read_sint();
+            retire_delta = Some(r.read_sint());
         }
         None
     };
@@ -624,14 +625,10 @@ fn decode_core_syntax_picture(
 
     if crate::trace::enabled() {
         let num_refs = parse_info.num_refs() as u32;
+        // References the stream names that are held exactly.
+        let held = |n: u32| references.iter().any(|r| r.picture_number == n) as u32;
         let ref_pic_count = match &inter_ctx {
-            Some(ctx) => {
-                find_ref(references, ctx.ref1_num).is_some() as u32
-                    + ctx
-                        .ref2_num
-                        .map(|n| find_ref(references, n).is_some() as u32)
-                        .unwrap_or(0)
-            }
+            Some(ctx) => held(ctx.ref1_num) + ctx.ref2_num.map(held).unwrap_or(0),
             None => 0,
         };
         emit_picture_trace(
@@ -649,12 +646,18 @@ fn decode_core_syntax_picture(
 
     // §15.8: motion-compensate (inter only) or just clip (intra).
     if let Some(ctx) = inter_ctx {
-        let ref1 = find_ref(references, ctx.ref1_num)
-            .ok_or(PictureError::MissingReference(ctx.ref1_num))?;
-        let ref2_pic = match ctx.ref2_num {
-            Some(n) => Some(find_ref(references, n).ok_or(PictureError::MissingReference(n))?),
-            None => None,
+        // FFmpeg's reference choice: the held picture closest to the one
+        // named; with none held, a blank one.
+        let blank = references.is_empty().then(|| blank_reference(sequence));
+        let pick = |n: u32| -> &ReferencePicture {
+            closest_reference(references, n).unwrap_or_else(|| {
+                blank
+                    .as_ref()
+                    .expect("blank made when no reference is held")
+            })
         };
+        let ref1 = pick(ctx.ref1_num);
+        let ref2_pic = ctx.ref2_num.map(pick);
         motion_compensate_all(
             &mut y_plane,
             &mut u_plane,
@@ -687,6 +690,9 @@ fn decode_core_syntax_picture(
         v,
         luma_depth: sequence.luma_depth,
         chroma_depth: sequence.chroma_depth,
+        retired_picture: retire_delta
+            .map(|d| picture_number.wrapping_add(d as u32))
+            .filter(|&n| n != picture_number),
     })
 }
 
@@ -730,10 +736,6 @@ fn offset_plane(plane: &[i32], depth: u32) -> Vec<i32> {
         1i32 << (depth - 1)
     };
     plane.iter().map(|v| v + half).collect()
-}
-
-fn find_ref(refs: &[ReferencePicture], n: u32) -> Option<&ReferencePicture> {
-    refs.iter().find(|r| r.picture_number == n)
 }
 
 #[allow(clippy::too_many_arguments)]

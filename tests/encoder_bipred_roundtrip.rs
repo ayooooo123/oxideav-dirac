@@ -128,7 +128,8 @@ fn synthetic_bipred_triplet() -> (
     (y0, u, v, y1, u, v, ymid, u, v)
 }
 
-/// Decode a stream and return its frames in send order.
+/// Decode a stream and return its frames in picture-number order, as
+/// FFmpeg outputs them.
 fn decode_stream(stream: Vec<u8>) -> Vec<oxideav_core::VideoFrame> {
     let mut reg = CodecRegistry::new();
     oxideav_dirac::register_codecs(&mut reg);
@@ -136,6 +137,7 @@ fn decode_stream(stream: Vec<u8>) -> Vec<oxideav_core::VideoFrame> {
     let mut dec = reg.first_decoder(&cp).expect("decoder");
     let packet = Packet::new(0, TimeBase::new(1, 25), stream);
     dec.send_packet(&packet).expect("send_packet");
+    dec.flush().expect("flush");
     let mut out = Vec::new();
     while let Ok(frame) = dec.receive_frame() {
         match frame {
@@ -191,21 +193,19 @@ fn bipred_self_roundtrip_with_residue_recovers_midpoint_b_frame() {
         "expected 3 decoded frames (intra-A, intra-B, bipred), got {}",
         frames.len()
     );
-    // Frames arrive in decode order. The bipred frame's pts is its
-    // picture_number = 1, so it sorts to position 1 in display order.
-    // We don't sort here — instead identify by content position.
-    // The first frame is intra A (picture_number = 0).
+    // Frames arrive in picture-number order, as FFmpeg outputs them:
+    // intra A (0), the bipred B (1), intra B (2).
     assert_eq!(
         frames[0].planes[0].data,
         y0.to_vec(),
         "intra-A Y bit-exact at qindex=0"
     );
     assert_eq!(
-        frames[1].planes[0].data,
+        frames[2].planes[0].data,
         y1.to_vec(),
         "intra-B Y bit-exact at qindex=0"
     );
-    let py = psnr(&frames[2].planes[0].data, &ym);
+    let py = psnr(&frames[1].planes[0].data, &ym);
     eprintln!("bipred B-frame self-roundtrip Y PSNR (residue ON): {py:.2} dB");
     // With residue at qindex = 0 the loop closes bit-exactly — the
     // residue captures whatever the 1/2-average of the OBMC predictions
@@ -274,11 +274,11 @@ fn bipred_with_codeblock_residue_recovers_b_frame() {
         "intra-A Y bit-exact at qindex=0"
     );
     assert_eq!(
-        frames[1].planes[0].data,
+        frames[2].planes[0].data,
         y1.to_vec(),
         "intra-B Y bit-exact at qindex=0"
     );
-    let py = psnr(&frames[2].planes[0].data, &ym);
+    let py = psnr(&frames[1].planes[0].data, &ym);
     eprintln!("bipred B-frame codeblock-residue Y PSNR: {py:.2} dB");
     assert!(
         py >= 60.0,
@@ -599,7 +599,7 @@ fn bipred_no_residue_beats_single_ref_no_residue_baseline() {
         &bipred,
     );
     let bipred_frames = decode_stream(bipred_stream);
-    let psnr_bipred = psnr(&bipred_frames[2].planes[0].data, &ym);
+    let psnr_bipred = psnr(&bipred_frames[1].planes[0].data, &ym);
 
     eprintln!(
         "midpoint-B fixture (no-residue): 1-ref Y = {psnr_1ref:.2} dB, \
@@ -900,7 +900,7 @@ fn bipred_widened_set_half_pel_favourable_self_roundtrip_no_residue() {
         );
         let frames = decode_stream(stream);
         assert_eq!(frames.len(), 3, "expected 3 frames");
-        // Frames arrive in decode order; bipred B has picture_number=1.
+        // The bipred B has picture_number = 1.
         let b = frames.iter().find(|f| f.pts == Some(1)).expect("B frame");
         psnr(&b.planes[0].data, &ym)
     };
@@ -1083,11 +1083,11 @@ fn bipred_global_motion_b_picture_roundtrips() {
         "intra-A Y bit-exact at qindex=0"
     );
     assert_eq!(
-        frames[1].planes[0].data,
+        frames[2].planes[0].data,
         y1.to_vec(),
         "intra-B Y bit-exact at qindex=0"
     );
-    let py = psnr(&frames[2].planes[0].data, &ym);
+    let py = psnr(&frames[1].planes[0].data, &ym);
     eprintln!("bipred global-motion B-frame Y PSNR: {py:.2} dB");
     assert!(
         py >= 60.0,
@@ -1237,8 +1237,8 @@ fn estimated_bipred_global_zoom_roundtrips_and_saves_bytes() {
         let frames = decode_stream(stream);
         assert!(frames.len() >= 3, "expected 3 frames, got {}", frames.len());
         assert_eq!(frames[0].planes[0].data, y0, "intra-A bit-exact");
-        assert_eq!(frames[1].planes[0].data, y2, "intra-B bit-exact");
-        (len, psnr(&frames[2].planes[0].data, &ym))
+        assert_eq!(frames[2].planes[0].data, y2, "intra-B bit-exact");
+        (len, psnr(&frames[1].planes[0].data, &ym))
     };
 
     let (len_block, psnr_block) = encode_len_psnr(&base);

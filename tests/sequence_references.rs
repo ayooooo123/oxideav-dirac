@@ -127,3 +127,39 @@ fn queued_sequences_keep_their_own_references() {
         "B queued after A differs from B alone"
     );
 }
+
+/// A seek resets the decoder (FFmpeg's `dirac_decode_flush`): the stream
+/// sent again from its start decodes as with a new decoder, though its
+/// picture numbers are below the count the first pass reached. A seek
+/// lands mid-stream, so no end of sequence comes before it: the stream is
+/// sent without its own.
+#[test]
+fn a_reset_decoder_decodes_the_stream_again() {
+    let mut b = sequence_b();
+    let end = b.len() - 13;
+    assert_eq!(
+        (&b[end..end + 4], b[end + 4]),
+        (&b"BBCD"[..], 0x10),
+        "end of sequence"
+    );
+    b.truncate(end);
+    let b_alone = decode(std::slice::from_ref(&b), true);
+    assert_eq!(b_alone.len(), 2, "sequence B alone");
+    let mut dec =
+        oxideav_dirac::decoder::make_decoder(&CodecParameters::video(CodecId::new("dirac")))
+            .expect("decoder");
+    let mut passes = Vec::new();
+    for _ in 0..2 {
+        let mut out = Vec::new();
+        dec.send_packet(&Packet::new(0, TimeBase::new(1, 25), b.clone()))
+            .expect("send");
+        receive_all(&mut *dec, &mut out);
+        dec.reset().expect("reset");
+        passes.push(out);
+    }
+    assert!(passes[0] == b_alone, "first pass differs from B alone");
+    assert!(
+        passes[1] == b_alone,
+        "the pass after the reset differs from B alone"
+    );
+}

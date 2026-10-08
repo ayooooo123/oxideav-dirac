@@ -82,6 +82,7 @@ fn decode_video_frames(stream: Vec<u8>) -> Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> {
     let mut dec = reg.first_decoder(&cp).expect("make decoder");
     let packet = Packet::new(0, TimeBase::new(1, 25), stream);
     dec.send_packet(&packet).expect("send_packet");
+    dec.flush().expect("flush");
 
     let mut frames = Vec::new();
     while let Ok(Frame::Video(vf)) = dec.receive_frame() {
@@ -121,28 +122,6 @@ fn parse_code_chain(stream: &[u8]) -> Vec<u8> {
         pos += pi.next_parse_offset as usize;
     }
     codes
-}
-
-/// Display index of each coded-order picture for `n` frames and GOP
-/// spacing `s` (mirrors the driver's coded-order emission: anchor,
-/// then per group the reference P before its Bs, then trailing).
-fn coded_to_display(n: usize, s: usize) -> Vec<usize> {
-    let mut order = vec![0usize];
-    let group = s + 1;
-    let mut idx = 1usize;
-    while idx < n {
-        if n - idx >= group {
-            order.push(idx + group - 1); // the reference P
-            for b in 0..group - 1 {
-                order.push(idx + b); // its Bs, display order
-            }
-            idx += group;
-        } else {
-            order.push(idx); // trailing 0x09
-            idx += 1;
-        }
-    }
-    order
 }
 
 #[test]
@@ -259,19 +238,17 @@ fn gop_q0_round_trips_bit_exact_through_coded_order() {
         u32::MAX,
         InterRateControl::PerPicture,
     );
+    // Decoded in coded order, output in display order, as FFmpeg does.
     let decoded = decode_video_frames(stream);
     assert_eq!(decoded.len(), frames.len());
-    let order = coded_to_display(frames.len(), 1);
-    for (coded_i, &display_i) in order.iter().enumerate() {
-        let (dy, du, dv) = &decoded[coded_i];
-        let f = &frames[display_i];
+    for (i, ((dy, du, dv), f)) in decoded.iter().zip(&frames).enumerate() {
         assert_eq!(
             dy.as_slice(),
             &f.y[..],
-            "coded frame {coded_i} (display {display_i}) Y bit-exact at q0"
+            "display frame {i} Y bit-exact at q0"
         );
-        assert_eq!(du.as_slice(), &f.u[..], "display {display_i} U");
-        assert_eq!(dv.as_slice(), &f.v[..], "display {display_i} V");
+        assert_eq!(du.as_slice(), &f.u[..], "display frame {i} U");
+        assert_eq!(dv.as_slice(), &f.v[..], "display frame {i} V");
     }
 }
 
@@ -352,10 +329,9 @@ fn gop_lossy_budget_stays_decodable() {
     );
     let decoded = decode_video_frames(stream);
     assert_eq!(decoded.len(), frames.len());
-    let order = coded_to_display(frames.len(), 1);
-    for (coded_i, &display_i) in order.iter().enumerate() {
-        let p = psnr(&decoded[coded_i].0, &frames[display_i].y);
-        eprintln!("display frame {display_i}: Y PSNR {p:.2} dB");
-        assert!(p > 28.0, "display frame {display_i} Y PSNR {p:.2} dB");
+    for (i, (d, f)) in decoded.iter().zip(&frames).enumerate() {
+        let p = psnr(&d.0, &f.y);
+        eprintln!("display frame {i}: Y PSNR {p:.2} dB");
+        assert!(p > 28.0, "display frame {i} Y PSNR {p:.2} dB");
     }
 }

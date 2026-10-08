@@ -3,7 +3,7 @@ name = "oxideav-dirac"
 version = "0.0.9"
 edition = "2021"
 rust-version = "1.80"
-license = "MIT"
+license = "MIT AND LGPL-2.1-or-later"
 repository = "https://github.com/OxideAV/oxideav-dirac"
 authors = ["Mark Karpeles"]
 description = "Pure-Rust Dirac / VC-2 (BBC) wavelet video codec for oxideav"
@@ -45,3 +45,9 @@ harness = false
 [[bench]]
 name = "roundtrip"
 harness = false
+
+# PearTube fork: build and test against the PearTube oxideav-core fork the
+# player uses (its Decoder trait has `output_video_dimensions` and
+# `output_pixel_format`), at the revision the player pins.
+[patch.crates-io]
+oxideav-core = { git = "https://github.com/ayooooo123/oxideav-core", rev = "9a314bf862480d019dc1133847ff6262d14ba628" }

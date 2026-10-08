@@ -9,9 +9,18 @@
 //!    `VideoFrame`.
 //! 5. Core-syntax inter pictures are decoded by driving
 //!    [`crate::picture::decode_picture_with_refs`] with the decoder's
-//!    own reference-picture buffer (§15.4). Reference pictures are
-//!    admitted on successful decode, oldest evicted when the buffer
-//!    fills.
+//!    own reference-picture buffer (§15.4), kept as FFmpeg 2da55bf's
+//!    `diracdec.c` keeps it: a reference picture first retires the
+//!    picture its header names, then joins; past 8, the oldest goes.
+//! 6. Pictures come out in picture-number order through FFmpeg's delay
+//!    buffer (`dirac_decode_frame`, `get_delayed_pic`): a picture ahead of
+//!    the next number to show waits (up to 5); one behind it is dropped.
+//!    Unlike FFmpeg, a new sequence first shows the pictures still waiting
+//!    and starts the count again: FFmpeg ignores a second sequence header
+//!    and keeps its count, so it shows none of the next sequence's
+//!    pictures numbered below it.
+//! 7. `reset` (a seek) is FFmpeg's `dirac_decode_flush`: waiting pictures
+//!    and references are dropped, and pictures wait for a sequence header.
 
 use oxideav_core::Decoder;
 use oxideav_core::{
@@ -20,6 +29,7 @@ use oxideav_core::{
 };
 
 use crate::picture::{decode_picture_with_refs, DecodedPicture, PictureError, ReferencePicture};
+use crate::picture_order::{admit_reference, OutputOrder};
 use crate::sequence::{parse_sequence_header, SequenceHeader};
 use crate::stream::DataUnitIter;
 use crate::video_format::ChromaFormat;
@@ -69,14 +79,13 @@ pub struct DiracDecoder {
     /// How far into `buffer` we've already scanned; used so we don't
     /// re-parse units after calling `scan()` repeatedly.
     scan_cursor: usize,
-    /// §15.4 reference picture buffer. Populated with reference
-    /// pictures (parse code has bits 2,3 set) after each successful
-    /// decode, and drained in FIFO order when full.
+    /// §15.4 reference picture buffer, oldest first (FFmpeg's
+    /// `ref_frames`).
     reference_buffer: Vec<ReferencePicture>,
-    /// Upper bound on the reference buffer — Annex D specifies this
-    /// per profile / level; conservative default 4 covers all profiles
-    /// we currently decode.
-    max_ref_buffer: usize,
+    /// FFmpeg's output order of the decoded frames.
+    order: OutputOrder<(VideoFrame, FrameLayout)>,
+    /// Frames due for `receive_frame`, in output order.
+    ready: std::collections::VecDeque<(VideoFrame, FrameLayout)>,
 }
 
 impl DiracDecoder {
@@ -98,7 +107,8 @@ impl DiracDecoder {
             eof: false,
             scan_cursor: 0,
             reference_buffer: Vec::new(),
-            max_ref_buffer: 4,
+            order: OutputOrder::new(),
+            ready: std::collections::VecDeque::new(),
         }
     }
 
@@ -185,22 +195,30 @@ impl DiracDecoder {
         Ok(())
     }
 
-    fn try_decode_next(&mut self) -> Result<Option<VideoFrame>> {
+    /// Decode the next pending picture, if any, and pass it through
+    /// FFmpeg's output order into `ready`. `Ok(false)`: nothing pending.
+    fn decode_next(&mut self) -> Result<bool> {
         loop {
             let payload = match self.pending.front() {
                 Some(p) => p.clone(),
-                None => return Ok(None),
+                None => return Ok(false),
             };
             let code = self.pending_codes.front().copied().unwrap_or(0);
             let Some((sequence, seq)) = self.pending_seq.front().cloned() else {
-                return Ok(None);
+                return Ok(false);
             };
             // The first picture of a new sequence retires the previous
             // sequence's references; pictures still queued from that
-            // sequence decoded before it, against them.
+            // sequence decoded before it, against them. The previous
+            // sequence's waiting pictures go out first, and the output
+            // count starts again.
             if sequence != self.reference_sequence {
                 self.reference_buffer.clear();
                 self.reference_sequence = sequence;
+                while let Some(out) = self.order.take_lowest() {
+                    self.ready.push_back(out);
+                }
+                self.order.clear();
             }
             let pi = crate::parse_info::ParseInfo {
                 parse_code: code,
@@ -234,28 +252,17 @@ impl DiracDecoder {
                         pkt_tb
                     };
                     let effective_pts = pkt_pts.or(Some(pic.picture_number as i64));
-                    self.last_output = Some(frame_layout(
+                    let layout = frame_layout(
                         &seq,
                         (pic.luma_width, pic.luma_height),
                         (pic.chroma_width, pic.chroma_height),
                         pic.luma_depth,
-                    ));
-                    return Ok(Some(decoded_to_video_frame(
-                        &pic,
-                        &seq,
-                        effective_pts,
-                        effective_tb,
-                    )));
-                }
-                Err(PictureError::MissingReference(_)) => {
-                    // The reference buffer hasn't caught up to this
-                    // inter picture — skip and continue.
-                    self.pending.pop_front();
-                    self.pending_codes.pop_front();
-                    self.pending_pts.pop_front();
-                    self.pending_time_base.pop_front();
-                    self.pending_seq.pop_front();
-                    continue;
+                    );
+                    let frame = decoded_to_video_frame(&pic, &seq, effective_pts, effective_tb);
+                    if let Some(out) = self.order.push(pic.picture_number, (frame, layout)) {
+                        self.ready.push_back(out);
+                    }
+                    return Ok(true);
                 }
                 Err(PictureError::InterNotImplemented) => {
                     // Should no longer happen, but preserve the skip
@@ -279,6 +286,9 @@ impl DiracDecoder {
         }
     }
 
+    /// Keep a decoded reference picture (FFmpeg's
+    /// `dirac_decode_picture_header`): it retires the picture its header
+    /// names, then joins; past 8, the oldest goes.
     fn push_reference(&mut self, pic: &DecodedPicture, seq: &SequenceHeader) {
         // Store a **pre-output-offset, clipped** copy: the decoded
         // picture we produce has already been offset for output, so we
@@ -307,10 +317,7 @@ impl DiracDecoder {
             u,
             v,
         };
-        self.reference_buffer.push(rp);
-        while self.reference_buffer.len() > self.max_ref_buffer {
-            self.reference_buffer.remove(0);
-        }
+        admit_reference(&mut self.reference_buffer, pic.retired_picture, rp);
     }
 
     /// The layout `output_*` report: the frame last returned; before the
@@ -385,18 +392,24 @@ impl Decoder for DiracDecoder {
     }
 
     fn receive_frame(&mut self) -> Result<Frame> {
-        if self.last_sequence.is_none() && self.pending.is_empty() {
-            return Err(Error::NeedMore);
-        }
-        match self.try_decode_next()? {
-            Some(vf) => Ok(Frame::Video(vf)),
-            None => {
-                if self.eof {
-                    Err(Error::Eof)
-                } else {
-                    Err(Error::NeedMore)
-                }
+        loop {
+            if let Some((frame, layout)) = self.ready.pop_front() {
+                self.last_output = Some(layout);
+                return Ok(Frame::Video(frame));
             }
+            if self.decode_next()? {
+                continue;
+            }
+            if !self.eof {
+                return Err(Error::NeedMore);
+            }
+            // End of stream: the waiting pictures, lowest number first
+            // (FFmpeg's get_delayed_pic).
+            let Some((frame, layout)) = self.order.take_lowest() else {
+                return Err(Error::Eof);
+            };
+            self.last_output = Some(layout);
+            return Ok(Frame::Video(frame));
         }
     }
 
@@ -417,6 +430,26 @@ impl Decoder for DiracDecoder {
     fn flush(&mut self) -> Result<()> {
         self.eof = true;
         self.scan()
+    }
+
+    /// FFmpeg's `dirac_decode_flush`: drop the waiting pictures, the
+    /// references and the sequence header, so decoding starts again at the
+    /// next sequence header with a new output count. The last returned
+    /// frame's layout stays reported.
+    fn reset(&mut self) -> Result<()> {
+        self.buffer.clear();
+        self.scan_cursor = 0;
+        self.last_sequence = None;
+        self.pending.clear();
+        self.pending_codes.clear();
+        self.pending_pts.clear();
+        self.pending_time_base.clear();
+        self.pending_seq.clear();
+        self.reference_buffer.clear();
+        self.order.clear();
+        self.ready.clear();
+        self.eof = false;
+        Ok(())
     }
 
     /// Arena-backed variant of `receive_frame` with a **correct**
@@ -803,6 +836,7 @@ mod tests {
         seq.chroma_height = 64;
         let pic = DecodedPicture {
             picture_number: 7,
+            retired_picture: None,
             luma_width: 64,
             luma_height: 64,
             chroma_width: 32,
@@ -899,6 +933,7 @@ mod tests {
         let seq = fake_sequence(25, 1, 12);
         let pic = DecodedPicture {
             picture_number: 0,
+            retired_picture: None,
             luma_width: 64,
             luma_height: 64,
             chroma_width: 32,
@@ -931,6 +966,7 @@ mod tests {
             seq.chroma_height = ch;
             let pic = DecodedPicture {
                 picture_number: 0,
+                retired_picture: None,
                 luma_width: 64,
                 luma_height: 64,
                 chroma_width: cw as usize,
@@ -963,6 +999,7 @@ mod tests {
         let seq = fake_sequence(25, 1, 16);
         let pic = DecodedPicture {
             picture_number: 0,
+            retired_picture: None,
             luma_width: 64,
             luma_height: 64,
             chroma_width: 32,
@@ -993,6 +1030,7 @@ mod tests {
         seq.chroma_height = 64;
         let pic = DecodedPicture {
             picture_number: 0,
+            retired_picture: None,
             luma_width: 64,
             luma_height: 64,
             chroma_width: 32,
@@ -1024,6 +1062,7 @@ mod tests {
         seq.chroma_height = 64;
         let pic = DecodedPicture {
             picture_number: 0,
+            retired_picture: None,
             luma_width: 64,
             luma_height: 64,
             chroma_width: 64,
